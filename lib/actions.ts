@@ -2,9 +2,12 @@
 
 import { createClient } from '@/lib/supabase/server';
 import {
+  AccountOverview,
   AuditFilter,
   AuditLog,
   CurrentEffectivePrice,
+  Hospital,
+  Profile,
   DateEntryDraft,
   DailyEntryFormData,
   DailyEntryWithItems,
@@ -13,8 +16,51 @@ import {
   MonthlySummaryItem,
   ScanCatalog,
   ScanPriceHistory,
+  Subscription,
 } from '@/lib/types';
 import { normalizeItemInputs } from '@/lib/calculations';
+
+async function requireUserAndSubscription(write = false) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+    error,
+  } = await supabase.auth.getUser();
+
+  if (error || !user) {
+    throw new Error('You must be signed in to continue.');
+  }
+
+  const sub = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', user.id)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const now = Date.now();
+  const trialActive = Boolean(
+    sub.data?.trial_end_at && new Date(sub.data.trial_end_at).getTime() >= now
+  );
+  const premiumActive = Boolean(
+    sub.data?.premium_end_at && new Date(sub.data.premium_end_at).getTime() >= now
+  );
+
+  const status = premiumActive
+    ? 'active'
+    : trialActive
+      ? 'trialing'
+      : sub.data?.subscription_status === 'canceled'
+        ? 'canceled'
+        : 'expired';
+
+  if (write && status === 'expired') {
+    throw new Error('Your trial has expired. Upgrade to continue editing data.');
+  }
+
+  return { supabase, userId: user.id, subscriptionStatus: status };
+}
 
 const DEFAULT_SCAN_PRICES: Array<{ name: string; price: number }> = [
   { name: 'Abdomen Pelvis', price: 1200 },
@@ -28,6 +74,10 @@ const DEFAULT_SCAN_PRICES: Array<{ name: string; price: number }> = [
   { name: 'Early Pregnancy', price: 1000 },
   { name: 'Small Parts (Swelling)', price: 1500 },
   { name: 'Follicular Study (3 visits)', price: 1800 },
+  { name: 'USG Neck', price: 1500 },
+  { name: 'Breast', price: 1500 },
+  { name: 'Scrotum', price: 1500 },
+  { name: 'Carotid Doppler', price: 2500 },
 ];
 const DEFAULT_PRICE_BY_NAME = new Map(DEFAULT_SCAN_PRICES.map((scan) => [scan.name, scan.price]));
 
@@ -235,26 +285,30 @@ async function resolvePriceMap(
 }
 
 export async function fetchScanCatalog(): Promise<ScanCatalog[]> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription();
   const { data, error } = await supabase
     .from('scan_catalog')
     .select('*')
+    .eq('user_id', userId)
     .eq('is_active', true)
+    .order('display_order', { ascending: true })
     .order('name', { ascending: true });
 
   if (error) throw new Error(`Failed to fetch scan catalog: ${error.message}`);
   return (data || []) as ScanCatalog[];
 }
 
-export async function fetchDateEntryDraft(entryDate: string): Promise<DateEntryDraft> {
-  const supabase = await createClient();
+export async function fetchDateEntryDraft(entryDate: string, hospitalId?: string): Promise<DateEntryDraft> {
+  const { supabase, userId } = await requireUserAndSubscription();
 
   const [catalog, entryResult] = await Promise.all([
     fetchScanCatalog(),
     supabase
       .from('daily_entries')
       .select('*')
+      .eq('user_id', userId)
       .eq('entry_date', entryDate)
+      .eq('hospital_id', hospitalId || null)
       .maybeSingle(),
   ]);
 
@@ -316,23 +370,31 @@ export async function fetchDateEntryDraft(entryDate: string): Promise<DateEntryD
     entry_id: entryResult.data?.id || null,
     lines,
     total_scans: totals.total_scans,
-    total_revenue: totals.total_revenue,
+    calculated_total_revenue: totals.total_revenue,
+    final_total_revenue: Number(entryResult.data?.final_total_revenue ?? totals.total_revenue),
+    is_manual_override: Boolean(entryResult.data?.is_manual_override),
+    manual_override_reason: entryResult.data?.manual_override_reason || '',
+    hospital_id: entryResult.data?.hospital_id || hospitalId || null,
   };
 }
 
 export async function fetchDailyEntriesForMonth(
   year: number,
-  month: number
+  month: number,
+  hospitalId?: string
 ): Promise<DailyEntryWithItems[]> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription();
   const { startDate, endDate } = monthRange(year, month);
 
-  const { data: entries, error: entriesError } = await supabase
+  let entriesQuery = supabase
     .from('daily_entries')
-    .select('*')
+    .select('*, hospital:hospital_id(name)')
+    .eq('user_id', userId)
     .gte('entry_date', startDate)
     .lte('entry_date', endDate)
     .order('entry_date', { ascending: false });
+  if (hospitalId && hospitalId !== 'all') entriesQuery = entriesQuery.eq('hospital_id', hospitalId);
+  const { data: entries, error: entriesError } = await entriesQuery;
 
   if (entriesError) throw new Error(`Failed to fetch daily entries: ${entriesError.message}`);
   if (!entries || entries.length === 0) return [];
@@ -360,19 +422,32 @@ export async function fetchDailyEntriesForMonth(
   return entries.map((entry) => ({
     ...entry,
     total_scans: Number(entry.total_scans),
-    total_revenue: Number(entry.total_revenue),
+    total_revenue: Number(entry.final_total_revenue ?? entry.total_revenue),
+    calculated_total_revenue: Number(entry.calculated_total_revenue ?? entry.total_revenue),
+    final_total_revenue: Number(entry.final_total_revenue ?? entry.total_revenue),
+    is_manual_override: Boolean(entry.is_manual_override),
+    manual_override_reason: entry.manual_override_reason ?? null,
+    hospital_name: (entry as any).hospital?.name ?? null,
     items: byEntry.get(entry.id) || [],
   })) as DailyEntryWithItems[];
 }
 
 export async function saveDailyEntry(formData: DailyEntryFormData): Promise<void> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription(true);
 
   const payload = {
     entry_date: formData.entry_date,
     notes: formData.notes || null,
+    hospital_id: formData.hospital_id || null,
+    use_manual_override: formData.use_manual_override || false,
+    manual_total_revenue: formData.manual_total_revenue ?? null,
+    manual_override_reason: formData.manual_override_reason || null,
     items: normalizeItemInputs(formData.items),
   };
+
+  if (payload.use_manual_override && (payload.manual_total_revenue == null || !payload.manual_override_reason)) {
+    throw new Error('Manual override reason and amount are required.');
+  }
 
   const rpcResult = await supabase.rpc('save_daily_entry_with_items', {
     p_entry_date: payload.entry_date,
@@ -388,9 +463,11 @@ export async function saveDailyEntry(formData: DailyEntryFormData): Promise<void
   const catalog = await fetchScanCatalog();
   const priceMap = await resolvePriceMap(payload.entry_date, catalog);
   const existingBefore = await supabase
-    .from('daily_entries')
+.from('daily_entries')
     .select('*')
+    .eq('user_id', userId)
     .eq('entry_date', payload.entry_date)
+    .eq('hospital_id', payload.hospital_id)
     .maybeSingle();
 
   const totalScans = payload.items.reduce((sum, item) => sum + item.quantity, 0);
@@ -399,17 +476,25 @@ export async function saveDailyEntry(formData: DailyEntryFormData): Promise<void
     return sum + item.quantity * price;
   }, 0);
 
+  const finalRevenue = payload.use_manual_override ? Number(payload.manual_total_revenue || 0) : totalRevenue;
+
   const upsertResult = await supabase
     .from('daily_entries')
     .upsert(
       {
+        user_id: userId,
+        hospital_id: payload.hospital_id,
         entry_date: payload.entry_date,
         notes: payload.notes,
         total_scans: totalScans,
-        total_revenue: totalRevenue,
+        total_revenue: finalRevenue,
+        calculated_total_revenue: totalRevenue,
+        final_total_revenue: finalRevenue,
+        is_manual_override: payload.use_manual_override,
+        manual_override_reason: payload.use_manual_override ? payload.manual_override_reason : null,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'entry_date' }
+      { onConflict: 'user_id,hospital_id,entry_date' }
     )
     .select('id')
     .single();
@@ -449,7 +534,7 @@ export async function saveDailyEntry(formData: DailyEntryFormData): Promise<void
   await writeAuditCompat({
     entityType: 'daily_entry',
     entityId: entryId,
-    entityLabel: payload.entry_date,
+    entityLabel: `${payload.entry_date} · ${payload.hospital_id || 'No hospital'}`,
     action: beforeSnapshot ? 'UPDATE' : 'CREATE',
     summary: `${beforeSnapshot ? 'Updated' : 'Created'} daily entry for ${payload.entry_date}`,
     beforeData: beforeSnapshot,
@@ -490,8 +575,8 @@ export async function deleteDailyEntry(entryId: string): Promise<void> {
   });
 }
 
-export async function getMonthlyStats(year: number, month: number): Promise<MonthlySummary> {
-  const entries = await fetchDailyEntriesForMonth(year, month);
+export async function getMonthlyStats(year: number, month: number, hospitalId?: string): Promise<MonthlySummary> {
+  const entries = await fetchDailyEntriesForMonth(year, month, hospitalId);
   const monthKey = `${year}-${String(month).padStart(2, '0')}`;
 
   if (entries.length === 0) {
@@ -553,31 +638,35 @@ export async function getMonthlyStats(year: number, month: number): Promise<Mont
   };
 }
 
-export async function getDailyStats(year: number, month: number): Promise<DailyStats[]> {
-  const supabase = await createClient();
+export async function getDailyStats(year: number, month: number, hospitalId?: string): Promise<DailyStats[]> {
+  const { supabase, userId } = await requireUserAndSubscription();
   const { startDate, endDate } = monthRange(year, month);
 
-  const { data, error } = await supabase
+  let query = supabase
     .from('daily_entries')
-    .select('entry_date, total_scans, total_revenue')
+    .select('entry_date, total_scans, final_total_revenue, total_revenue')
+    .eq('user_id', userId)
     .gte('entry_date', startDate)
     .lte('entry_date', endDate)
     .order('entry_date', { ascending: true });
+  if (hospitalId && hospitalId !== 'all') query = query.eq('hospital_id', hospitalId);
+  const { data, error } = await query;
 
   if (error) throw new Error(`Failed to fetch daily stats: ${error.message}`);
 
   return (data || []).map((row) => ({
     date: row.entry_date,
     total_scans: Number(row.total_scans),
-    total_revenue: Number(row.total_revenue),
+    total_revenue: Number((row as any).final_total_revenue ?? row.total_revenue),
   }));
 }
 
 export async function fetchCurrentEffectivePrices(): Promise<CurrentEffectivePrice[]> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription();
   const modern = await supabase
-    .from('current_effective_prices')
+.from('current_effective_prices')
     .select('*')
+    .eq('user_id', userId)
     .order('scan_name', { ascending: true });
 
   if (!modern.error) {
@@ -592,8 +681,9 @@ export async function fetchCurrentEffectivePrices(): Promise<CurrentEffectivePri
   }
 
   const catalog = await supabase
-    .from('scan_catalog')
+.from('scan_catalog')
     .select('id, name, price')
+    .eq('user_id', userId)
     .eq('is_active', true)
     .order('name', { ascending: true });
   if (catalog.error) {
@@ -669,11 +759,12 @@ export async function fetchCurrentEffectivePrices(): Promise<CurrentEffectivePri
 }
 
 export async function fetchScanPriceHistory(scanCatalogId: string): Promise<ScanPriceHistory[]> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription();
   const modern = await supabase
     .from('scan_price_history')
     .select('*')
-    .eq('scan_catalog_id', scanCatalogId)
+.eq('scan_catalog_id', scanCatalogId)
+    .eq('user_id', userId)
     .order('effective_start_date', { ascending: false })
     .order('created_at', { ascending: false });
 
@@ -739,7 +830,7 @@ export async function updateScanPrice(
   effectiveStartDate: string,
   reason?: string
 ): Promise<void> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription(true);
   const rpcResult = await supabase.rpc('add_scan_price_with_audit', {
     p_scan_catalog_id: scanCatalogId,
     p_price: Number(newPrice),
@@ -753,6 +844,7 @@ export async function updateScanPrice(
   }
 
   const modernInsert = await supabase.from('scan_price_history').insert({
+    user_id: userId,
     scan_catalog_id: scanCatalogId,
     price: Number(newPrice),
     effective_start_date: effectiveStartDate,
@@ -831,7 +923,8 @@ export async function updateScanPrice(
   const confirmModern = await supabase
     .from('scan_price_history')
     .select('id')
-    .eq('scan_catalog_id', scanCatalogId)
+.eq('scan_catalog_id', scanCatalogId)
+    .eq('user_id', userId)
     .limit(1);
   if (confirmModern.error && isMissingTableError(confirmModern.error.message)) {
     // No-op: legacy-only schemas may skip this table entirely.
@@ -1054,17 +1147,18 @@ export async function fetchAuditLogs(
 export async function seedDefaultCatalogAndPrices(
   effectiveStartDate = '2025-01-01'
 ): Promise<void> {
-  const supabase = await createClient();
+  const { supabase, userId } = await requireUserAndSubscription(true);
 
   let catalogError = (
     await supabase.from('scan_catalog').upsert(
       DEFAULT_SCAN_PRICES.map((scan) => ({
+        user_id: userId,
         name: scan.name,
         modality: 'Ultrasound',
         is_active: true,
         price: scan.price,
       })) as any,
-      { onConflict: 'name' }
+      { onConflict: 'user_id,name' }
     )
   ).error;
 
@@ -1072,11 +1166,12 @@ export async function seedDefaultCatalogAndPrices(
     catalogError = (
       await supabase.from('scan_catalog').upsert(
     DEFAULT_SCAN_PRICES.map((scan) => ({
+      user_id: userId,
       name: scan.name,
       modality: 'Ultrasound',
       is_active: true,
     })),
-    { onConflict: 'name' }
+    { onConflict: 'user_id,name' }
       )
     ).error;
   }
@@ -1088,6 +1183,7 @@ export async function seedDefaultCatalogAndPrices(
   const { data: catalogRows, error: fetchError } = await supabase
     .from('scan_catalog')
     .select('id, name')
+    .eq('user_id', userId)
     .in(
       'name',
       DEFAULT_SCAN_PRICES.map((scan) => scan.name)
@@ -1099,6 +1195,7 @@ export async function seedDefaultCatalogAndPrices(
 
   const idByName = new Map(catalogRows.map((row) => [row.name, row.id]));
   const historyRows = DEFAULT_SCAN_PRICES.map((scan) => ({
+    user_id: userId,
     scan_catalog_id: idByName.get(scan.name),
     price: scan.price,
     effective_start_date: effectiveStartDate,
@@ -1133,4 +1230,118 @@ export async function seedDefaultCatalogAndPrices(
   }
 
   throw new Error(`Failed to seed scan price history: ${modernHistory.error.message}`);
+}
+
+export async function getSubscriptionStatus() {
+  const { subscriptionStatus } = await requireUserAndSubscription();
+  return subscriptionStatus as 'trialing' | 'active' | 'expired' | 'canceled';
+}
+
+export async function bootstrapUserOnboarding(fullName?: string) {
+  const { supabase, userId } = await requireUserAndSubscription(true);
+
+  await supabase.from('profiles').upsert({ id: userId, full_name: fullName || null });
+
+  const existingSub = await supabase
+    .from('subscriptions')
+    .select('id')
+    .eq('user_id', userId)
+    .limit(1)
+    .maybeSingle();
+
+  if (!existingSub.data) {
+    const start = new Date();
+    const end = new Date(start);
+    end.setMonth(end.getMonth() + 1);
+    await supabase.from('subscriptions').insert({
+      user_id: userId,
+      subscription_status: 'trialing',
+      plan_name: 'Free Trial',
+      trial_start_at: start.toISOString(),
+      trial_end_at: end.toISOString(),
+    });
+  }
+
+  const hospitals = await supabase.from('hospitals').select('id').eq('user_id', userId).limit(1);
+  if (!hospitals.data || hospitals.data.length === 0) {
+    await supabase.from('hospitals').insert({ user_id: userId, name: 'Primary Hospital' });
+  }
+
+  await seedDefaultCatalogAndPrices();
+}
+
+export async function fetchHospitals(includeInactive = false): Promise<Hospital[]> {
+  const { supabase, userId } = await requireUserAndSubscription();
+  let query = supabase.from('hospitals').select('*').eq('user_id', userId).order('name', { ascending: true });
+  if (!includeInactive) query = query.eq('is_active', true);
+  const { data, error } = await query;
+  if (error) throw new Error(`Failed to fetch hospitals: ${error.message}`);
+  return (data || []) as Hospital[];
+}
+
+export async function createHospital(name: string, location?: string) {
+  const { supabase, userId } = await requireUserAndSubscription(true);
+  const { error } = await supabase.from('hospitals').insert({ user_id: userId, name, location: location || null });
+  if (error) throw new Error(`Failed to create hospital: ${error.message}`);
+}
+
+export async function updateHospital(hospitalId: string, patch: { name?: string; location?: string; is_active?: boolean }) {
+  const { supabase, userId } = await requireUserAndSubscription(true);
+  const { error } = await supabase.from('hospitals').update(patch).eq('id', hospitalId).eq('user_id', userId);
+  if (error) throw new Error(`Failed to update hospital: ${error.message}`);
+}
+
+export async function createCategory(name: string, initialPrice: number, effectiveStartDate: string) {
+  const { supabase, userId } = await requireUserAndSubscription(true);
+  const category = await supabase
+    .from('scan_catalog')
+    .insert({ user_id: userId, name, modality: 'Ultrasound', is_active: true })
+    .select('id')
+    .single();
+  if (category.error || !category.data) throw new Error(`Failed to create category: ${category.error?.message}`);
+
+  const history = await supabase.from('scan_price_history').insert({
+    user_id: userId,
+    scan_catalog_id: category.data.id,
+    price: initialPrice,
+    effective_start_date: effectiveStartDate,
+    reason: 'Initial category price',
+  });
+  if (history.error) throw new Error(`Failed to set initial category price: ${history.error.message}`);
+}
+
+export async function updateCategory(categoryId: string, patch: { name?: string; is_active?: boolean; display_order?: number }) {
+  const { supabase, userId } = await requireUserAndSubscription(true);
+  const { error } = await supabase.from('scan_catalog').update(patch).eq('id', categoryId).eq('user_id', userId);
+  if (error) throw new Error(`Failed to update category: ${error.message}`);
+}
+
+export async function getAccountOverview(): Promise<AccountOverview> {
+  const { supabase, userId, subscriptionStatus } = await requireUserAndSubscription();
+  const userResult = await supabase.auth.getUser();
+  const profile = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+  const subscription = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', userId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const hospitals = await supabase.from('hospitals').select('id', { count: 'exact', head: true }).eq('user_id', userId);
+  const categories = await supabase.from('scan_catalog').select('id', { count: 'exact', head: true }).eq('user_id', userId);
+
+  const trialEnd = subscription.data?.premium_end_at || subscription.data?.trial_end_at;
+  const daysRemaining = trialEnd
+    ? Math.max(0, Math.ceil((new Date(trialEnd).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+    : 0;
+
+  return {
+    user_email: userResult.data.user?.email || '',
+    profile: (profile.data as Profile) || null,
+    subscription: (subscription.data as Subscription) || null,
+    days_remaining: daysRemaining,
+    hospitals_count: hospitals.count || 0,
+    categories_count: categories.count || 0,
+    is_read_only: subscriptionStatus === 'expired',
+  };
 }
